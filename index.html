@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Bazen Light Control</title>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@jaames/iro@5"></script>
+  <link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#007fff">
+<link rel="icon" type="image/png" sizes="512x512" href="/icon512_maskable.png">
+
+  <style>
+    body {
+      font-family: 'Space Grotesk', sans-serif;
+      transition: background-color .3s linear;
+    }
+    .backdrop {
+      background: radial-gradient(circle at top left, rgba(255,255,255,.08), transparent 70%);
+    }
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 12px;
+      background: linear-gradient(to left, white, black);
+      border-radius: 9999px;
+      outline: none;
+      opacity: 0.9;
+    }
+    input[type="range"]::-webkit-slider-thumb,
+    input[type="range"]::-moz-range-thumb {
+      height: 20px;
+      width: 20px;
+      background: #fff;
+      border-radius: 50%;
+      border: 2px solid #ccc;
+      box-shadow: 0 0 4px rgba(0,0,0,0.3);
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body class="backdrop min-h-screen px-4 py-8 flex flex-col items-center gap-8 text-white bg-black">
+  <header class="w-full max-w-md text-center">
+    <h1 class="text-3xl font-bold">Bazen Lighting</h1>
+    <p id="status" class="text-sm opacity-80 mt-1">Connecting…</p>
+  </header>
+
+  <main class="w-full max-w-md flex flex-col items-center gap-6">
+    <div id="colorPicker" class="w-full flex justify-center"></div>
+
+    <label class="w-full flex flex-col items-center gap-2">
+      <span class="uppercase tracking-widest text-xs opacity-80">White</span>
+      <input id="whiteSlider" type="range" min="0" max="255" value="0" class="w-full accent-white/90 h-2 bg-white/30">
+      <span id="whiteVal" class="text-sm font-mono opacity-80">0</span>
+    </label>
+
+    <div id="animationButtons" class="w-full flex flex-wrap gap-2 justify-center mt-4"></div>
+  </main>
+
+  <script>
+    /* ---------------- CONFIG ---------------- */
+    const settings = {
+      mqttBaseTopic: '/iot/grega',
+      host: 'wss://bikepower.etiam.si:8443/mqtt',
+      username: 'arduino',
+      password: 'pass',
+      defaultTransition: 0, // ms for manual sends
+      minInterval: 1000     // limit updates to once per second
+    };
+
+    /* ---------------- HELPERS ---------------- */
+    const hexPair = n => n.toString(16).padStart(2,'0').toUpperCase();
+    const hexDur  = ms => Math.min(ms, 0xFFFF).toString(16).padStart(4,'0').toUpperCase();
+
+    function rgbwToPayload(r,g,b,w){ return hexPair(r)+hexPair(g)+hexPair(b)+hexPair(w); }
+
+    function rgbwToDisplayHex({r,g,b,w}){
+      const R = Math.min(255, r + w);
+      const G = Math.min(255, g + w);
+      const B = Math.min(255, b + w);
+      return '#' + hexPair(R) + hexPair(G) + hexPair(B);
+    }
+
+    /* ---------------- DOM ---------------- */
+    const statusEl    = document.getElementById('status');
+    const whiteSlider = document.getElementById('whiteSlider');
+    const whiteVal    = document.getElementById('whiteVal');
+    const animButtons = document.getElementById('animationButtons');
+
+    /* ---------------- COLOR PICKER ---------------- */
+    const picker = new iro.ColorPicker('#colorPicker', {
+      width: Math.min(window.innerWidth*0.9, 320),
+      layout: [ { component: iro.ui.Wheel } ], // removed value slider
+      color: '#0080ff',
+    });
+
+    /* ---------------- STATE ---------------- */
+    const FPS_MIN = 24;
+    let current   = { r: picker.color.red, g: picker.color.green, b: picker.color.blue, w: +whiteSlider.value };
+    let selected  = { ...current };
+    let previewFrame  = null;
+    let ignorePicker  = false;
+    let animTimeout   = null;
+
+    // Throttling helpers
+    let lastSent = 0;
+    let sendTimeout = null;
+
+    /* ---------------- VISUALS ---------------- */
+    function updateDisplay(rgbw){
+      const hex = rgbwToDisplayHex(rgbw);
+      document.body.style.backgroundColor = hex;
+      const lum = 0.2126*parseInt(hex.slice(1,3),16) + 0.7152*parseInt(hex.slice(3,5),16) + 0.0722*parseInt(hex.slice(5,7),16);
+      document.body.classList.toggle('text-black', lum > 140);
+      document.body.classList.toggle('text-white', lum <= 140);
+    }
+
+    function syncUI(){
+      ignorePicker = true;
+      picker.color.rgb = { r: current.r, g: current.g, b: current.b };
+      ignorePicker = false;
+      whiteSlider.value = current.w;
+      whiteVal.textContent = current.w;
+      updateDisplay(current);
+    }
+
+    function animatePreview(target, duration){
+      if(previewFrame){ cancelAnimationFrame(previewFrame); previewFrame = null; }
+      if(!duration || duration<=0){ current = {...target}; syncUI(); return; }
+      const start = {...current};
+      const startTS = performance.now();
+      const frameGap = 1000 / FPS_MIN;
+      let lastDraw = startTS;
+      const step = (now)=>{
+        const t = Math.min(1, (now-startTS)/duration);
+        if(now-lastDraw >= frameGap || t===1){
+          const lerp = (a,b)=>a + (b-a)*t;
+          current = {
+            r: Math.round(lerp(start.r, target.r)),
+            g: Math.round(lerp(start.g, target.g)),
+            b: Math.round(lerp(start.b, target.b)),
+            w: Math.round(lerp(start.w, target.w)),
+          };
+          syncUI();
+          lastDraw = now;
+        }
+        if(t<1){ previewFrame = requestAnimationFrame(step); }
+      };
+      previewFrame = requestAnimationFrame(step);
+    }
+
+    /* ---------------- MQTT ---------------- */
+    const mqttOptions = {
+      keepalive: 60,
+      clientId: 'rgbw-controller-' + Math.random().toString(16).slice(2,8),
+      protocolId: 'MQTT', protocolVersion:4, clean:true,
+      reconnectPeriod: 2000, connectTimeout:30000,
+      username: settings.username, password: settings.password, path:'/mqtt',
+    };
+
+    const client = mqtt.connect(settings.host, mqttOptions);
+
+    client.on('connect', ()=>{
+      statusEl.textContent = 'Connected';
+      client.subscribe(`${settings.mqttBaseTopic}/rgbw`);
+      client.subscribe(`${settings.mqttBaseTopic}/pong`);
+      client.publish(`${settings.mqttBaseTopic}/ping`, '1');
+    });
+    client.on('reconnect', ()=> statusEl.textContent='Reconnecting…');
+    client.on('error', e=>{ console.error('MQTT error',e); statusEl.textContent='Connection error'; client.end(); });
+
+    client.on('message', (topic,payload)=>{
+      const data = payload.toString().trim();
+      if(topic.endsWith('/pong')){
+        statusEl.textContent = data==='200' ? 'Connected' : 'Ping failed';
+        return;
+      }
+      if(topic.endsWith('/rgbw')){
+        if(!/^([0-9a-f]{8}|[0-9a-f]{12})$/i.test(data)) return; // ignore malformed
+        const newColor = {
+          r: parseInt(data.slice(0,2),16),
+          g: parseInt(data.slice(2,4),16),
+          b: parseInt(data.slice(4,6),16),
+          w: parseInt(data.slice(6,8),16),
+        };
+        const dur = data.length===12 ? parseInt(data.slice(8,12),16) : 0;
+        animatePreview(newColor, dur);
+      }
+    });
+
+    /* ---------------- THROTTLED SENDER ---------------- */
+    function sendSelected(){
+      const now = Date.now();
+      const elapsed = now - lastSent;
+      if(elapsed >= settings.minInterval){
+        doSend();
+      } else {
+        if(!sendTimeout){
+          sendTimeout = setTimeout(()=>{
+            doSend();
+          }, settings.minInterval - elapsed);
+        }
+      }
+    }
+
+    function doSend(){
+      sendTimeout = null;
+      lastSent = Date.now();
+      stopPredefinedAnim();
+      const dur = settings.defaultTransition;
+      const payload = rgbwToPayload(selected.r, selected.g, selected.b, selected.w) + hexDur(dur);
+      client.publish(`${settings.mqttBaseTopic}/rgbw`, payload);
+      animatePreview({...selected}, dur);
+      statusEl.textContent = 'Color sent';
+    }
+
+    /* ---------------- UI EVENTS ---------------- */
+    picker.on('color:change', color=>{
+      if(ignorePicker) return;
+      selected.r = color.red;
+      selected.g = color.green;
+      selected.b = color.blue;
+      sendSelected();
+    });
+
+    whiteSlider.addEventListener('input', e=>{
+      selected.w = +e.target.value;
+      whiteVal.textContent = selected.w;
+      sendSelected();
+    });
+
+    /* ---------------- PREDEFINED ANIMS ---------------- */
+    const predefined = [
+  {
+    "name": "Party Blast",
+    "steps": [
+      {"r": 255, "g": 150, "b": 150, "w": 80, "duration": 500},
+      {"r": 150, "g": 255, "b": 150, "w": 80, "duration": 500},
+      {"r": 150, "g": 150, "b": 255, "w": 80, "duration": 500},
+      {"r": 255, "g": 255, "b": 150, "w": 80, "duration": 500},
+      {"r": 150, "g": 255, "b": 255, "w": 80, "duration": 500},
+      {"r": 255, "g": 150, "b": 255, "w": 80, "duration": 500},
+      {"r": 255, "g": 200, "b": 150, "w": 80, "duration": 500},
+      {"r": 200, "g": 255, "b": 150, "w": 80, "duration": 500},
+      {"r": 150, "g": 200, "b": 255, "w": 80, "duration": 500}
+    ]
+  },
+  {
+    "name": "Tranquil Teal",
+    "steps": [
+      {"r": 50, "g": 200, "b": 200, "w": 50, "duration": 3000},
+      {"r": 50, "g": 230, "b": 230, "w": 40, "duration": 3000},
+      {"r": 50, "g": 200, "b": 200, "w": 50, "duration": 3000},
+      {"r": 50, "g": 170, "b": 170, "w": 45, "duration": 3000}
+    ]
+  },
+  {
+    "name": "Romantic Glow",
+    "steps": [
+      {"r": 255, "g": 200, "b": 200, "w": 40, "duration": 4000},
+      {"r": 250, "g": 100, "b": 150, "w": 45, "duration": 5000},
+      {"r": 255, "g": 150, "b": 250, "w": 35, "duration": 4000},
+      {"r": 250, "g": 50, "b": 130, "w": 40, "duration": 6000}
+    ]
+  },
+  {
+    "name": "Galactic Swirl",
+    "steps": [
+      {"r": 100, "g": 50, "b": 180, "w": 40, "duration": 5000},
+      {"r": 70, "g": 50, "b": 140, "w": 35, "duration": 4000},
+      {"r": 130, "g": 50, "b": 200, "w": 45, "duration": 6000},
+      {"r": 80, "g": 50, "b": 160, "w": 38, "duration": 5000},
+      {"r": 150, "g": 100, "b": 250, "w": 42, "duration": 7000}
+    ]
+  },
+  {
+    "name": "Blue Calm",
+    "steps": [
+      {"r": 50, "g": 100, "b": 200, "w": 40, "duration": 4000},
+      {"r": 50, "g": 70, "b": 150, "w": 35, "duration": 5000},
+      {"r": 50, "g": 130, "b": 250, "w": 45, "duration": 3000},
+      {"r": 50, "g": 90, "b": 170, "w": 38, "duration": 4500}
+    ]
+  }
+];
+
+    function playAnim(anim){
+      stopPredefinedAnim();
+      let idx=0;
+      function next(){
+        const step = anim.steps[idx];
+        const payload = rgbwToPayload(step.r,step.g,step.b,step.w) + hexDur(step.duration);
+        client.publish(`${settings.mqttBaseTopic}/rgbw`, payload);
+        animatePreview(step, step.duration);
+        idx = (idx+1)%anim.steps.length;
+        animTimeout = setTimeout(next, step.duration);
+      }
+      next();
+    }
+
+    function stopPredefinedAnim(){ if(animTimeout){ clearTimeout(animTimeout); animTimeout=null; } }
+
+    // render buttons
+    predefined.forEach(anim=>{
+      const b=document.createElement('button');
+      b.textContent=anim.name;
+      b.className='rounded-full px-4 py-2 text-sm bg-white/10 hover:bg-white/20 ring-1 ring-white/20';
+      b.addEventListener('click', ()=>playAnim(anim));
+      animButtons.appendChild(b);
+    });
+    const stopBtn=document.createElement('button');
+    stopBtn.textContent='Stop Animation';
+    stopBtn.className='rounded-full px-4 py-2 text-sm bg-red-500 hover:bg-red-600 text-white';
+    stopBtn.addEventListener('click', stopPredefinedAnim);
+    animButtons.appendChild(stopBtn);
+
+    /* ---------------- INIT ---------------- */
+    syncUI();
+    window.addEventListener('resize', ()=> picker.resize(Math.min(window.innerWidth*0.9,320)) );
+  </script>
+</body>
+</html>

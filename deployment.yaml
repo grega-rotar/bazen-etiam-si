@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bazen-lights
+  namespace: pirnice-hq
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bazen-lights
+  template:
+    metadata:
+      labels:
+        app: bazen-lights
+    spec:
+      containers:
+      - name: bazen-lights
+        image: registry.etiam.si/public/bazen-lights:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bazen-lights-service
+  namespace: pirnice-hq
+spec:
+  type: ClusterIP
+  selector:
+    app: bazen-lights
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bazen-lights-ingress
+  namespace: pirnice-hq
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: bazen.etiam.si
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bazen-lights-service
+                port:
+                  number: 8080
