@@ -59,6 +59,13 @@
     </label>
 
     <div id="animationButtons" class="w-full flex flex-wrap gap-2 justify-center mt-4"></div>
+
+    <button id="turnOnWhite" class="w-full mt-4 py-4 text-lg font-semibold rounded-xl bg-green-600 hover:bg-red-700 text-white transition">
+      Full Power White
+    </button>
+    <button id="turnOffBtn" class="w-full mt-4 py-4 text-lg font-semibold rounded-xl bg-red-600 hover:bg-red-700 text-white transition">
+      Turn Off Lights
+    </button>
   </main>
 
   <script>
@@ -94,7 +101,7 @@
     /* ---------------- COLOR PICKER ---------------- */
     const picker = new iro.ColorPicker('#colorPicker', {
       width: Math.min(window.innerWidth*0.9, 320),
-      layout: [ { component: iro.ui.Wheel } ], // removed value slider
+      layout: [ { component: iro.ui.Wheel }, { component: iro.ui.Slider, options: { sliderType: 'value' } }], // removed value slider
       color: '#0080ff',
     });
 
@@ -321,6 +328,15 @@
     /* ---------------- INIT ---------------- */
     syncUI();
     window.addEventListener('resize', ()=> picker.resize(Math.min(window.innerWidth*0.9,320)) );
+
+    document.getElementById('turnOffBtn').addEventListener('click', () => {
+  selected = { r: 0, g: 0, b: 0, w: 0 };
+  sendSelected();
+});
+document.getElementById('turnOnWhite').addEventListener('click', () => {
+  selected = { r: 255, g: 255, b: 255, w: 255 };
+  sendSelected();
+});
   </script>
 </body>
 </html>
